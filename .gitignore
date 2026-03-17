@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Data pribadi (jangan di-commit)
+data/
+
+# Streamlit
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
