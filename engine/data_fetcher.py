@@ -160,10 +160,16 @@ def get_foreign_stock_metrics(
 @st.cache_data(ttl=300)
 def get_usd_idr_rate() -> float:
     """
-    Ambil kurs USD/IDR terkini dari Yahoo Finance.
-    Fallback ke USD_IDR_BASE jika gagal.
+    Ambil kurs USD/IDR terkini.
+    Sumber 1: Yahoo Finance (USDIDR=X)
+    Sumber 2: Frankfurter API (gratis, tanpa API key)
+    Fallback: USD_IDR_BASE dari config
     """
+    import urllib.request
+    import json
     from config import USD_IDR_BASE
+
+    # Sumber 1: Yahoo Finance
     try:
         ticker = yf.Ticker("USDIDR=X")
         hist = ticker.history(period="2d")
@@ -171,6 +177,18 @@ def get_usd_idr_rate() -> float:
             rate = hist["Close"].iloc[-1]
             if 10_000 <= rate <= 25_000:
                 return round(float(rate), 0)
-        return USD_IDR_BASE
     except Exception:
-        return USD_IDR_BASE
+        pass
+
+    # Sumber 2: Frankfurter API (ECB rates)
+    try:
+        url = "https://api.frankfurter.app/latest?from=USD&to=IDR"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read())
+            rate = data["rates"]["IDR"]
+            if 10_000 <= rate <= 25_000:
+                return round(float(rate), 0)
+    except Exception:
+        pass
+
+    return USD_IDR_BASE
