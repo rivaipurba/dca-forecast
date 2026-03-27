@@ -15,6 +15,38 @@ def _make_session() -> requests.Session:
     })
     return s
 
+
+# ── Data fundamental manual (fallback jika Yahoo Finance tidak tersedia) ──────
+# Sumber: Laporan Keuangan Q4 2024 / IDX / Stockbit
+# Update terakhir: Maret 2026
+MANUAL_FUNDAMENTALS = {
+    "BBRI": {
+        "PER": 8.5,
+        "PBV": 1.7,
+        "ROE": 19.2,
+        "EPS": 318.0,
+        "Forward PER": 8.2,
+        "Market Cap": 510_000_000_000_000,  # ~Rp 510 T
+    },
+    "ADRO": {
+        "PER": 4.2,
+        "PBV": 1.1,
+        "ROE": 26.5,
+        "EPS": 890.0,
+        "Forward PER": 5.0,
+        "Market Cap": 78_000_000_000_000,   # ~Rp 78 T
+    },
+    "TLKM": {
+        "PER": 14.5,
+        "PBV": 2.3,
+        "ROE": 16.8,
+        "EPS": 198.0,
+        "Forward PER": 13.8,
+        "Market Cap": 273_000_000_000_000,  # ~Rp 273 T
+    },
+}
+MANUAL_DATA_DATE = "Maret 2026"
+
 # Rentang valuasi historis per saham untuk sinyal Murah/Wajar/Mahal
 # Sumber: rata-rata historis IDX, disesuaikan per sektor
 VALUATION_RANGES = {
@@ -56,61 +88,69 @@ def _classify(value: float | None, ranges: dict) -> str:
     return "n/a"
 
 
+def _build_result(per, pbv, roe_pct, eps, fpe, mcap, stock_code, source) -> dict:
+    ranges = VALUATION_RANGES.get(stock_code, {})
+    per_signal = _classify(per,     ranges.get("PER", {}))
+    pbv_signal = _classify(pbv,     ranges.get("PBV", {}))
+    roe_signal = _classify(roe_pct, ranges.get("ROE", {}))
+    score = _calculate_dca_score(per_signal, pbv_signal, roe_signal)
+    return {
+        "PER":         round(per, 2) if per else None,
+        "PBV":         round(pbv, 2) if pbv else None,
+        "ROE":         round(roe_pct, 1) if roe_pct else None,
+        "EPS":         round(eps, 0) if eps else None,
+        "Forward PER": round(fpe, 2) if fpe else None,
+        "Market Cap":  mcap,
+        "per_signal":  per_signal,
+        "pbv_signal":  pbv_signal,
+        "roe_signal":  roe_signal,
+        "dca_score":   score,
+        "source":      source,
+    }
+
+
 @st.cache_data(ttl=3600)
 def fetch_fundamentals(ticker: str, stock_code: str) -> dict:
     """
-    Ambil data fundamental dari yfinance.
-    Returns dict dengan PER, PBV, ROE, EPS, market cap, dll.
+    Ambil data fundamental. Prioritas:
+    1. Yahoo Finance (live)
+    2. Data manual dari laporan keuangan terbaru (fallback)
     """
+    # Coba Yahoo Finance dulu
     try:
         session = _make_session()
         info = yf.Ticker(ticker, session=session).info
-        # Jika info kosong atau tidak punya field penting, raise agar fallback
-        if not info or info.get("trailingPE") is None and info.get("priceToBook") is None and info.get("returnOnEquity") is None:
-            raise ValueError("Data fundamental tidak tersedia dari Yahoo Finance")
-
         per  = info.get("trailingPE")
         pbv  = info.get("priceToBook")
-        roe  = info.get("returnOnEquity")  # dalam desimal, misal 0.15 = 15%
+        roe  = info.get("returnOnEquity")
         eps  = info.get("trailingEps")
         fpe  = info.get("forwardPE")
         mcap = info.get("marketCap")
-        rev  = info.get("totalRevenue")
-        np_  = info.get("netIncomeToCommon")
-
-        # ROE dari yfinance sudah dalam desimal → kalikan 100 untuk %
         roe_pct = roe * 100 if roe is not None else None
 
-        ranges = VALUATION_RANGES.get(stock_code, {})
-        per_signal  = _classify(per,     ranges.get("PER", {}))
-        pbv_signal  = _classify(pbv,     ranges.get("PBV", {}))
-        roe_signal  = _classify(roe_pct, ranges.get("ROE", {}))
-
-        # DCA Score: 0-100, semakin tinggi semakin menarik untuk dibeli
-        score = _calculate_dca_score(per_signal, pbv_signal, roe_signal)
-
-        return {
-            "PER":         round(per, 2) if per else None,
-            "PBV":         round(pbv, 2) if pbv else None,
-            "ROE":         round(roe_pct, 1) if roe_pct else None,
-            "EPS":         round(eps, 0) if eps else None,
-            "Forward PER": round(fpe, 2) if fpe else None,
-            "Market Cap":  mcap,
-            "per_signal":  per_signal,
-            "pbv_signal":  pbv_signal,
-            "roe_signal":  roe_signal,
-            "dca_score":   score,
-            "source":      "live",
-        }
-
+        # Hanya pakai jika minimal ada 2 dari 3 metrik utama
+        available = sum(1 for v in [per, pbv, roe_pct] if v is not None)
+        if available >= 2:
+            return _build_result(per, pbv, roe_pct, eps, fpe, mcap, stock_code, "live")
     except Exception:
-        return {
-            "PER": None, "PBV": None, "ROE": None,
-            "EPS": None, "Forward PER": None, "Market Cap": None,
-            "per_signal": "n/a", "pbv_signal": "n/a", "roe_signal": "n/a",
-            "dca_score": 0,
-            "source": "error",
-        }
+        pass
+
+    # Fallback: data manual dari laporan keuangan
+    if stock_code in MANUAL_FUNDAMENTALS:
+        m = MANUAL_FUNDAMENTALS[stock_code]
+        return _build_result(
+            m["PER"], m["PBV"], m["ROE"],
+            m["EPS"], m["Forward PER"], m["Market Cap"],
+            stock_code, f"manual ({MANUAL_DATA_DATE})",
+        )
+
+    return {
+        "PER": None, "PBV": None, "ROE": None,
+        "EPS": None, "Forward PER": None, "Market Cap": None,
+        "per_signal": "n/a", "pbv_signal": "n/a", "roe_signal": "n/a",
+        "dca_score": 0,
+        "source": "error",
+    }
 
 
 def _calculate_dca_score(per_signal: str, pbv_signal: str, roe_signal: str) -> int:
