@@ -1,5 +1,19 @@
 import yfinance as yf
 import streamlit as st
+import requests
+
+
+def _make_session() -> requests.Session:
+    """Session dengan User-Agent agar tidak diblokir Yahoo Finance."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    })
+    return s
 
 # Rentang valuasi historis per saham untuk sinyal Murah/Wajar/Mahal
 # Sumber: rata-rata historis IDX, disesuaikan per sektor
@@ -49,7 +63,11 @@ def fetch_fundamentals(ticker: str, stock_code: str) -> dict:
     Returns dict dengan PER, PBV, ROE, EPS, market cap, dll.
     """
     try:
-        info = yf.Ticker(ticker).info
+        session = _make_session()
+        info = yf.Ticker(ticker, session=session).info
+        # Jika info kosong atau tidak punya field penting, raise agar fallback
+        if not info or info.get("trailingPE") is None and info.get("priceToBook") is None and info.get("returnOnEquity") is None:
+            raise ValueError("Data fundamental tidak tersedia dari Yahoo Finance")
 
         per  = info.get("trailingPE")
         pbv  = info.get("priceToBook")

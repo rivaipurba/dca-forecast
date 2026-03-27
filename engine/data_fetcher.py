@@ -2,6 +2,20 @@ import yfinance as yf
 import numpy as np
 import pandas as pd
 import streamlit as st
+import requests
+
+
+def _make_session() -> requests.Session:
+    """Session dengan User-Agent agar tidak diblokir Yahoo Finance."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    })
+    return s
 
 
 @st.cache_data(ttl=3600)  # cache 1 jam, hindari hit API terus menerus
@@ -18,7 +32,7 @@ def get_stock_metrics(
     Fallback ke nilai default jika API gagal.
     """
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker, session=_make_session())
         hist = stock.history(period="10y")  # 10 tahun untuk kurangi bias event jangka pendek
 
         if len(hist) < 252:
@@ -81,7 +95,7 @@ def get_current_prices(tickers: list[str]) -> dict[str, float | None]:
     prices = {}
     for ticker in tickers:
         try:
-            hist = yf.Ticker(ticker).history(period="2d")
+            hist = yf.Ticker(ticker, session=_make_session()).history(period="2d")
             prices[ticker] = round(hist["Close"].iloc[-1], 0) if not hist.empty else None
         except Exception:
             prices[ticker] = None
@@ -103,7 +117,7 @@ def get_foreign_stock_metrics(
     Harga dikembalikan dalam USD.
     """
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker, session=_make_session())
         hist = stock.history(period="10y")
 
         if len(hist) < 252:
@@ -171,7 +185,7 @@ def get_usd_idr_rate() -> float:
 
     # Sumber 1: Yahoo Finance
     try:
-        ticker = yf.Ticker("USDIDR=X")
+        ticker = yf.Ticker("USDIDR=X", session=_make_session())
         hist = ticker.history(period="2d")
         if not hist.empty:
             rate = hist["Close"].iloc[-1]
