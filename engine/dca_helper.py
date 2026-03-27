@@ -69,11 +69,13 @@ def get_dca_recommendation(
 
 def format_rupiah(value: float) -> str:
     """Format angka ke format Rupiah Indonesia."""
-    if value >= 1_000_000_000:
-        return f"Rp {value / 1_000_000_000:.2f} M"
-    elif value >= 1_000_000:
-        return f"Rp {value / 1_000_000:.1f} jt"
-    elif value >= 1_000:
-        return f"Rp {value / 1_000:.0f} rb"
+    sign = "-" if value < 0 else ""
+    abs_value = abs(value)
+    if abs_value >= 1_000_000_000:
+        return f"Rp {sign}{abs_value / 1_000_000_000:.2f} M"
+    elif abs_value >= 1_000_000:
+        return f"Rp {sign}{abs_value / 1_000_000:.1f} jt"
+    elif abs_value >= 1_000:
+        return f"Rp {sign}{abs_value / 1_000:.0f} rb"
     else:
-        return f"Rp {value:.0f}"
+        return f"Rp {sign}{abs_value:.0f}"

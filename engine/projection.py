@@ -151,3 +151,114 @@ def calculate_required_dca(
 
     required_dca = (target_portfolio - pv_grown) / annuity_factor
     return max(required_dca, 0)
+
+
+def simulate_foreign_dca(
+    initial_value_usd: float,
+    monthly_dca_idr: float,
+    years: int,
+    annual_return: float,
+    annual_volatility: float,
+    annual_div_yield: float,
+    usd_idr_rate: float,
+    idr_depreciation: float = 0.035,
+    reinvest_div: bool = True,
+    n_simulations: int = 500,
+    seed: int = 43,
+) -> dict:
+    """
+    Simulasi DCA untuk portofolio ETF asing (GoTrade) dalam USD,
+    lalu dikonversi ke IDR dengan mempertimbangkan depresiasi rupiah.
+
+    - monthly_dca_idr: kontribusi bulanan dalam IDR, dikonversi ke USD tiap bulan
+      menggunakan kurs proyeksi bulan tersebut
+    - usd_idr_rate: kurs awal (Rp per 1 USD)
+    - idr_depreciation: laju depresiasi IDR per tahun (default 3.5%)
+
+    Hasilnya dikembalikan dalam IDR.
+    """
+    np.random.seed(seed)
+    months = years * 12
+
+    monthly_return = (1 + annual_return) ** (1 / 12) - 1
+    monthly_vol = annual_volatility / np.sqrt(12)
+    monthly_div = annual_div_yield / 12
+    monthly_depreciation = (1 + idr_depreciation) ** (1 / 12) - 1
+
+    # Simulasi dalam USD
+    portfolio_usd = np.zeros((n_simulations, months + 1))
+    portfolio_usd[:, 0] = initial_value_usd
+
+    total_invested_idr = np.zeros(months + 1)
+    total_invested_idr[0] = initial_value_usd * usd_idr_rate
+
+    for m in range(1, months + 1):
+        rate_at_month = usd_idr_rate * ((1 + monthly_depreciation) ** m)
+        monthly_dca_usd = monthly_dca_idr / rate_at_month
+
+        r = np.random.normal(monthly_return, monthly_vol, n_simulations)
+        after_growth = portfolio_usd[:, m - 1] * (1 + r)
+        if reinvest_div:
+            after_growth = after_growth * (1 + monthly_div)
+        portfolio_usd[:, m] = after_growth + monthly_dca_usd
+
+        total_invested_idr[m] = total_invested_idr[m - 1] + monthly_dca_idr
+
+    # Konversi portofolio USD ke IDR menggunakan kurs proyeksi tiap bulan
+    portfolio_idr = np.zeros_like(portfolio_usd)
+    for m in range(months + 1):
+        rate_at_month = usd_idr_rate * ((1 + monthly_depreciation) ** m)
+        portfolio_idr[:, m] = portfolio_usd[:, m] * rate_at_month
+
+    today = date.today()
+    time_labels = [today + relativedelta(months=m) for m in range(months + 1)]
+    years_labels = [m / 12 for m in range(months + 1)]
+
+    return {
+        "simulations": portfolio_idr,
+        "simulations_usd": portfolio_usd,
+        "total_invested": total_invested_idr,
+        "time_labels": time_labels,
+        "years_labels": years_labels,
+        "p10": np.percentile(portfolio_idr, 10, axis=0),
+        "p50": np.percentile(portfolio_idr, 50, axis=0),
+        "p90": np.percentile(portfolio_idr, 90, axis=0),
+        "p10_usd": np.percentile(portfolio_usd, 10, axis=0),
+        "p50_usd": np.percentile(portfolio_usd, 50, axis=0),
+        "p90_usd": np.percentile(portfolio_usd, 90, axis=0),
+    }
+
+
+def simulate_combined_portfolio(
+    idx_result: dict,
+    foreign_result: dict,
+) -> dict:
+    """
+    Gabungkan hasil simulasi IDX (IDR) dan Foreign/GoTrade (USD->IDR).
+    Kedua result harus memiliki jumlah bulan yang sama.
+    Returns dict dengan combined p10/p50/p90 dan total_invested.
+    """
+    combined_sims = idx_result["simulations"] + foreign_result["simulations"]
+    combined_invested = idx_result["total_invested"] + foreign_result["total_invested"]
+
+    return {
+        "simulations": combined_sims,
+        "total_invested": combined_invested,
+        "time_labels": idx_result["time_labels"],
+        "years_labels": idx_result["years_labels"],
+        "p10": np.percentile(combined_sims, 10, axis=0),
+        "p50": np.percentile(combined_sims, 50, axis=0),
+        "p90": np.percentile(combined_sims, 90, axis=0),
+    }
+
+
+def project_future_usd_idr(
+    base_rate: float,
+    idr_depreciation: float,
+    years: int,
+) -> np.ndarray:
+    """
+    Proyeksi kurs USD/IDR ke depan.
+    Mengembalikan array kurs untuk setiap tahun dari 0 sampai years.
+    """
+    return np.array([base_rate * ((1 + idr_depreciation) ** y) for y in range(years + 1)])

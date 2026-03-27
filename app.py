@@ -5,11 +5,14 @@ import pandas as pd
 import numpy as np
 from datetime import date
 
-from config import STOCKS, DCA_MONTHLY, INVESTMENT_YEARS, LOT_SIZE, N_SIMULATIONS, HISTORY_FILE
-from engine.data_fetcher import get_stock_metrics, get_current_prices
+from config import (STOCKS, DCA_MONTHLY, INVESTMENT_YEARS, LOT_SIZE, N_SIMULATIONS, HISTORY_FILE,
+                    FOREIGN_STOCKS, USD_IDR_BASE, IDR_DEPRECIATION, IDX_DCA_RATIO, GOTRADE_DCA_RATIO,
+                    GOTRADE_HISTORY_FILE)
+from engine.data_fetcher import get_stock_metrics, get_current_prices, get_foreign_stock_metrics, get_usd_idr_rate
 from engine.projection import (
     simulate_dca, calculate_blended_metrics, project_dividend_income,
     apply_inflation, calculate_required_dca,
+    simulate_foreign_dca, simulate_combined_portfolio, project_future_usd_idr,
 )
 from engine.dca_helper import get_dca_recommendation, format_rupiah
 from engine.fundamental import fetch_fundamentals, VALUATION_RANGES, SIGNAL_EMOJI, format_market_cap
@@ -17,6 +20,11 @@ from engine.history_manager import (
     load_history, save_transaction, save_history,
     compute_holdings, compute_cost_basis,
     compute_unrealized_pl, compute_portfolio_trajectory,
+)
+from engine.gotrade_manager import (
+    load_gotrade_history, save_gotrade_transaction, save_gotrade_history,
+    compute_gotrade_holdings, compute_gotrade_cost_basis,
+    compute_gotrade_unrealized_pl, compute_gotrade_trajectory,
 )
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
@@ -50,6 +58,7 @@ st.markdown("""
 # ─── Load History (sebelum sidebar, untuk derive lots) ───────────────────────
 history = load_history(HISTORY_FILE)
 history_lots = compute_holdings(history)
+gotrade_history = load_gotrade_history(GOTRADE_HISTORY_FILE)
 
 # ─── Sidebar — Konfigurasi ────────────────────────────────────────────────────
 with st.sidebar:
@@ -101,8 +110,55 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Target Alokasi ─────────────────────────────────────────────────────
-    st.subheader("🎯 Target Alokasi")
+    # ── Split DCA: IDX vs GoTrade ──────────────────────────────────────────
+    st.subheader("🌍 Split IDX vs GoTrade")
+    gotrade_ratio = st.slider(
+        "Porsi GoTrade (%)", 0, 100, int(GOTRADE_DCA_RATIO * 100),
+        help="Persentase DCA yang dialokasikan ke ETF asing via GoTrade"
+    )
+    idx_ratio = 100 - gotrade_ratio
+    idx_dca = int(monthly_dca * idx_ratio / 100)
+    gotrade_dca = int(monthly_dca * gotrade_ratio / 100)
+    col_split1, col_split2 = st.columns(2)
+    col_split1.metric("IDX/bulan", format_rupiah(idx_dca))
+    col_split2.metric("GoTrade/bulan", format_rupiah(gotrade_dca))
+
+    st.divider()
+
+    # ── Kurs USD/IDR ───────────────────────────────────────────────────────
+    st.subheader("💱 Kurs USD/IDR")
+    live_usd_idr = get_usd_idr_rate()
+    usd_idr_rate = st.number_input(
+        "Kurs USD/IDR saat ini (Rp)",
+        min_value=10_000, max_value=25_000,
+        value=int(live_usd_idr), step=100, format="%d",
+        help=f"Live: Rp {live_usd_idr:,.0f}. Edit jika ingin pakai asumsi berbeda."
+    )
+    idr_depreciation = st.slider(
+        "Depresiasi IDR (%/tahun)", 0.0, 8.0, float(IDR_DEPRECIATION * 100), step=0.5,
+        help="Historis IDR melemah ~3-4%/tahun terhadap USD."
+    ) / 100
+
+    gotrade_initial_usd = st.number_input(
+        "Saldo awal GoTrade (USD)",
+        min_value=0.0,
+        value=29.34,
+        step=1.0,
+        format="%.2f",
+        help="Deposit awal atau saldo GoTrade saat ini dalam USD. Default: $29.34 (~Rp500.000)",
+    )
+
+    with st.expander("🔧 Alokasi GoTrade (VTI vs QQQ)"):
+        vti_pct = st.slider("VTI %", 0, 100, 70, help="Porsi VTI dari total GoTrade (seluruh pasar AS, ~4000 saham)")
+        qqq_pct = 100 - vti_pct
+        st.caption(f"QQQ otomatis: {qqq_pct}%")
+        st.caption("VTI = Total US Market, expense ratio 0.03% · QQQ = Nasdaq-100, expense ratio 0.20%")
+        foreign_alloc = {"VTI": vti_pct / 100, "QQQ": qqq_pct / 100}
+
+    st.divider()
+
+    # ── Target Alokasi IDX ─────────────────────────────────────────────────
+    st.subheader("🎯 Target Alokasi IDX")
     alloc_bbri = st.slider("BBRI %", 0, 100, 50)
     alloc_adro = st.slider("ADRO %", 0, 100 - alloc_bbri, 30)
     alloc_tlkm = 100 - alloc_bbri - alloc_adro
@@ -176,8 +232,21 @@ with st.spinner("Mengambil data saham dari Yahoo Finance..."):
     live_prices_raw = get_current_prices(tickers)
     live_prices = {ticker_to_code[t]: p for t, p in live_prices_raw.items()}
 
-# Blended portfolio metrics berdasarkan target alokasi
+    # Load foreign ETF metrics (GoTrade)
+    foreign_metrics = {}
+    for code, cfg in FOREIGN_STOCKS.items():
+        foreign_metrics[code] = get_foreign_stock_metrics(
+            cfg["ticker"],
+            cfg["default_cagr"],
+            cfg["default_div_yield"],
+            cfg["default_volatility"],
+        )
+
+# Blended metrics IDX
 blended = calculate_blended_metrics(stock_metrics, target_alloc)
+
+# Blended metrics GoTrade
+blended_foreign = calculate_blended_metrics(foreign_metrics, foreign_alloc)
 
 # Hitung nilai portfolio awal dari holding saat ini
 initial_portfolio_value = 0
@@ -185,10 +254,10 @@ for code, lots in current_lots.items():
     price = live_prices.get(code) or (lots * 4000)  # fallback estimasi
     initial_portfolio_value += lots * LOT_SIZE * price
 
-# Jalankan simulasi Monte Carlo
+# Simulasi IDX (dalam IDR)
 result = simulate_dca(
     initial_value=initial_portfolio_value,
-    monthly_dca=monthly_dca,
+    monthly_dca=idx_dca,
     years=years,
     annual_return=blended["cagr"],
     annual_volatility=blended["volatility"],
@@ -197,16 +266,33 @@ result = simulate_dca(
     n_simulations=N_SIMULATIONS,
 )
 
-# Proyeksi dividen di tahun pensiun (nilai akhir simulasi)
+# Simulasi GoTrade (USD → IDR)
+foreign_result = simulate_foreign_dca(
+    initial_value_usd=gotrade_initial_usd,
+    monthly_dca_idr=gotrade_dca,
+    years=years,
+    annual_return=blended_foreign["cagr"],
+    annual_volatility=blended_foreign["volatility"],
+    annual_div_yield=blended_foreign["div_yield"],
+    usd_idr_rate=usd_idr_rate,
+    idr_depreciation=idr_depreciation,
+    reinvest_div=reinvest_div,
+    n_simulations=N_SIMULATIONS,
+)
+
+# Gabung kedua simulasi
+combined_result = simulate_combined_portfolio(result, foreign_result)
+
+# Proyeksi dividen di tahun pensiun (IDX saja, ETF asing yield rendah)
 final_values = result["simulations"][:, -1]
 div_income = project_dividend_income(final_values, blended["div_yield"])
 
-# DCA recommendation bulan ini
+# DCA recommendation bulan ini (hanya untuk IDX, pakai idx_dca)
 dca_rec = get_dca_recommendation(
     current_prices=live_prices,
     current_lots=current_lots,
     target_alloc=target_alloc,
-    monthly_budget=monthly_dca,
+    monthly_budget=idx_dca,
     accumulated_cash=accumulated_cash,
 )
 
@@ -216,23 +302,26 @@ retirement_year = date.today().year + years
 st.caption(f"Simulasi DCA {format_rupiah(monthly_dca)}/bulan selama {years} tahun — Target pensiun: **{retirement_year}**")
 
 # ─── Tab Layout ──────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📊 Proyeksi Portfolio",
     "💰 Dashboard Pensiun",
     "📅 DCA Bulan Ini",
     "📒 Riwayat DCA",
     "🔮 What-If",
     "🔍 Fundamental",
+    "🌍 IDX vs Asing",
 ])
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 1: PROYEKSI PORTFOLIO
 # ════════════════════════════════════════════════════════════════════════════
 with tab1:
-    total_invested = result["total_invested"][-1]
-    proj_base = result["p50"][-1]
-    proj_best = result["p90"][-1]
+    total_invested = combined_result["total_invested"][-1]
+    proj_base = combined_result["p50"][-1]
+    proj_best = combined_result["p90"][-1]
     multiplier = proj_base / total_invested if total_invested > 0 else 0
+    idx_final = result["p50"][-1]
+    foreign_final = foreign_result["p50"][-1]
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric(
@@ -260,79 +349,65 @@ with tab1:
 
     # ── Monte Carlo Chart ─────────────────────────────────────────────────
     years_axis = result["years_labels"]
-    invested_line = result["total_invested"]
+
+    display_p10 = combined_result["p10"].copy()
+    display_p50 = combined_result["p50"].copy()
+    display_p90 = combined_result["p90"].copy()
+    idx_p50_line = result["p50"].copy()
+    foreign_p50_line = foreign_result["p50"].copy()
+    invested_line = combined_result["total_invested"].copy()
+
+    if show_real:
+        display_p10 = apply_inflation(display_p10, years_axis, inflation_rate)
+        display_p50 = apply_inflation(display_p50, years_axis, inflation_rate)
+        display_p90 = apply_inflation(display_p90, years_axis, inflation_rate)
+        idx_p50_line = apply_inflation(idx_p50_line, years_axis, inflation_rate)
+        foreign_p50_line = apply_inflation(foreign_p50_line, years_axis, inflation_rate)
+        invested_line = apply_inflation(invested_line, years_axis, inflation_rate)
 
     fig = go.Figure()
 
-    # Area optimis-pesimis
     fig.add_trace(go.Scatter(
-        x=years_axis, y=result["p90"],
-        fill=None, mode="lines",
-        line=dict(color="rgba(99,202,109,0.3)", width=0),
-        showlegend=False, name="Optimis (P90)",
+        x=years_axis, y=display_p90 / 1e6, mode="lines",
+        line=dict(width=0), name="P90 (Optimis)", showlegend=True,
     ))
     fig.add_trace(go.Scatter(
-        x=years_axis, y=result["p10"],
-        fill="tonexty", mode="lines",
-        fillcolor="rgba(99,202,109,0.12)",
-        line=dict(color="rgba(99,202,109,0.3)", width=0),
-        name="Rentang P10–P90",
+        x=years_axis, y=display_p10 / 1e6, mode="lines",
+        line=dict(width=0), name="P10 (Pesimis)",
+        fill="tonexty", fillcolor="rgba(100,149,237,0.15)", showlegend=True,
     ))
-
-    # Garis P50 (median)
     fig.add_trace(go.Scatter(
-        x=years_axis, y=result["p50"],
-        mode="lines", name="Proyeksi Median (P50)",
-        line=dict(color="#63ca6d", width=2.5),
+        x=years_axis, y=foreign_p50_line / 1e6, mode="lines",
+        line=dict(color="#9467bd", width=1.5, dash="dot"),
+        name="GoTrade ETF (USD→IDR)",
     ))
-
-    # Garis P90
     fig.add_trace(go.Scatter(
-        x=years_axis, y=result["p90"],
-        mode="lines", name="Skenario Optimis (P90)",
-        line=dict(color="#63ca6d", width=1.5, dash="dot"),
+        x=years_axis, y=idx_p50_line / 1e6, mode="lines",
+        line=dict(color="#1f77b4", width=1.5, dash="dot"),
+        name="Saham Indonesia (IDX)",
     ))
-
-    # Garis P10
     fig.add_trace(go.Scatter(
-        x=years_axis, y=result["p10"],
-        mode="lines", name="Skenario Pesimis (P10)",
-        line=dict(color="#e07b54", width=1.5, dash="dot"),
+        x=years_axis, y=display_p50 / 1e6, mode="lines",
+        line=dict(color="#00d4aa", width=3),
+        name="Total Portfolio (Median)",
     ))
-
-    # Garis modal yang diinvestasikan
     fig.add_trace(go.Scatter(
-        x=years_axis, y=invested_line,
-        mode="lines", name="Total Modal Diinvestasikan",
+        x=years_axis, y=invested_line / 1e6, mode="lines",
         line=dict(color="#a0a0b0", width=1.5, dash="dash"),
+        name="Modal Diinvestasikan",
     ))
 
-    real_note = ""
-    if show_real:
-        real_note = f" — Nilai Riil (inflasi {inflation_rate*100:.1f}%/tahun)"
-        p50_plot  = apply_inflation(result["p50"],  years_axis, inflation_rate)
-        p10_plot  = apply_inflation(result["p10"],  years_axis, inflation_rate)
-        p90_plot  = apply_inflation(result["p90"],  years_axis, inflation_rate)
-        # Update traces yang sudah ada
-        fig.data[0].y = p90_plot
-        fig.data[1].y = p10_plot
-        fig.data[2].y = p50_plot
-        fig.data[3].y = p90_plot
-        fig.data[4].y = p10_plot
-
+    label = "Nilai Riil" if show_real else "Nilai Nominal"
     fig.update_layout(
-        title=f"Proyeksi Pertumbuhan Portfolio (Monte Carlo){real_note}",
+        title=f"Proyeksi Portfolio Gabungan (IDX + GoTrade) — {label}",
         xaxis_title="Tahun ke-",
-        yaxis_title="Nilai Portfolio (Rp)",
-        yaxis_tickformat=",",
+        yaxis_title="Nilai Portfolio (Juta Rp)",
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        height=420,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        height=480,
         template="plotly_dark",
     )
-
-    # Custom y-axis labels (dalam juta/miliar)
-    fig.update_yaxes(tickprefix="Rp ", tickformat=".2s")
+    fig.update_yaxes(tickprefix="Rp ", ticksuffix="M")
     st.plotly_chart(fig, use_container_width=True)
 
     # ── Asumsi Return Per Saham ───────────────────────────────────────────
@@ -398,11 +473,12 @@ with tab2:
     </div>
     """, unsafe_allow_html=True)
 
-    # KPI nilai portfolio di tahun pensiun
+    # KPI nilai portfolio di tahun pensiun (combined IDX + GoTrade)
+    combined_final = combined_result["simulations"][:, -1]
     col1, col2, col3 = st.columns(3)
-    col1.metric("Nilai Portfolio (Pesimis)", format_rupiah(np.percentile(final_values, 10)))
-    col2.metric("Nilai Portfolio (Median)", format_rupiah(np.percentile(final_values, 50)))
-    col3.metric("Nilai Portfolio (Optimis)", format_rupiah(np.percentile(final_values, 90)))
+    col1.metric("Nilai Portfolio (Pesimis)", format_rupiah(np.percentile(combined_final, 10)))
+    col2.metric("Nilai Portfolio (Median)", format_rupiah(np.percentile(combined_final, 50)))
+    col3.metric("Nilai Portfolio (Optimis)", format_rupiah(np.percentile(combined_final, 90)))
 
     st.divider()
 
@@ -410,6 +486,7 @@ with tab2:
     riil_label = f" (Nilai Riil, inflasi {inflation_rate*100:.1f}%/tahun)" if show_real else " (Nilai Nominal)"
     st.subheader(f"📈 Proyeksi Dividen Bulanan Sepanjang Perjalanan{riil_label}")
 
+    # Dividen dari IDX (GoTrade ETF yield sangat rendah, tidak material)
     monthly_div_p50 = result["p50"] * blended["div_yield"] / 12
     monthly_div_p10 = result["p10"] * blended["div_yield"] / 12
     monthly_div_p90 = result["p90"] * blended["div_yield"] / 12
@@ -460,14 +537,17 @@ with tab2:
     milestone_labels = ["Rp 100 jt", "Rp 250 jt", "Rp 500 jt", "Rp 1 Miliar"]
 
     cols = st.columns(len(milestones))
-    p50_series = result["p50"]
+    p50_series = combined_result["p50"]
     for i, (target_val, label) in enumerate(zip(milestones, milestone_labels)):
-        months_reach = np.argmax(p50_series >= target_val)
-        if months_reach == 0 and p50_series[0] < target_val:
-            cols[i].metric(label, "Belum tercapai", "dalam 25 tahun")
+        if p50_series[0] >= target_val:
+            cols[i].metric(label, "Sudah tercapai", "sejak awal")
         else:
-            yr = months_reach / 12
-            cols[i].metric(label, f"Tahun ke-{yr:.1f}", f"± {date.today().year + int(yr)}")
+            months_reach = np.argmax(p50_series >= target_val)
+            if months_reach == 0:
+                cols[i].metric(label, "Belum tercapai", "dalam 25 tahun")
+            else:
+                yr = months_reach / 12
+                cols[i].metric(label, f"Tahun ke-{yr:.1f}", f"± {date.today().year + int(yr)}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -495,7 +575,7 @@ with tab3:
         if price:
             lot_price = price * LOT_SIZE
             st.warning(
-                f"Budget Rp {monthly_dca:,.0f} belum cukup untuk 1 lot {recommended} "
+                f"Budget IDX {format_rupiah(idx_dca)} belum cukup untuk 1 lot {recommended} "
                 f"(harga 1 lot ≈ {format_rupiah(lot_price)}).  \n"
                 f"Akumulasikan sisa kas ke bulan depan."
             )
@@ -561,8 +641,9 @@ with tab3:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     st.caption(
-        f"Total nilai portfolio saat ini: **{format_rupiah(rec['total_portfolio'])}** | "
-        f"Budget tersedia: **{format_rupiah(rec['available_budget'])}**"
+        f"Total nilai portfolio IDX saat ini: **{format_rupiah(rec['total_portfolio'])}** | "
+        f"Budget IDX tersedia: **{format_rupiah(rec['available_budget'])}** "
+        f"(GoTrade {format_rupiah(gotrade_dca)}/bln dikelola terpisah via GoTrade app)"
     )
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -642,22 +723,36 @@ with tab4:
 
         # Total summary
         total_modal_all = sum(b["total_cost"] for b in cost_basis.values())
-        total_pasar_all = sum(
-            v["market_value"] for v in unrealized.values()
-            if v.get("market_value") is not None
+        has_live_prices_idx = any(
+            v.get("market_value") is not None for v in unrealized.values()
         )
-        total_pl = total_pasar_all - total_modal_all
-        total_pl_pct = (total_pl / total_modal_all * 100) if total_modal_all > 0 else 0
-        pl_sign = "+" if total_pl >= 0 else ""
+        if not has_live_prices_idx:
+            st.warning("Harga live tidak tersedia. P/L tidak bisa dihitung.")
+        else:
+            total_pasar_all = sum(
+                v["market_value"] for v in unrealized.values()
+                if v.get("market_value") is not None
+            )
+            stocks_with_price = sum(
+                1 for v in unrealized.values() if v.get("market_value") is not None
+            )
+            stocks_total = len(unrealized)
+            total_pl = total_pasar_all - total_modal_all
+            total_pl_pct = (total_pl / total_modal_all * 100) if total_modal_all > 0 else 0
+            pl_sign = "+" if total_pl >= 0 else ""
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Modal Aktual", format_rupiah(total_modal_all))
-        col2.metric("Total Nilai Pasar", format_rupiah(total_pasar_all))
-        col3.metric(
-            "Total Unrealized P/L",
-            f"{pl_sign}{format_rupiah(total_pl)}",
-            f"{pl_sign}{total_pl_pct:.1f}%",
-        )
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total Modal Aktual", format_rupiah(total_modal_all))
+            col2.metric("Total Nilai Pasar", format_rupiah(total_pasar_all))
+            col3.metric(
+                "Total Unrealized P/L",
+                f"{pl_sign}{format_rupiah(total_pl)}",
+                f"{pl_sign}{total_pl_pct:.1f}%",
+            )
+            if stocks_with_price < stocks_total:
+                st.caption(
+                    f"P/L dihitung dari {stocks_with_price}/{stocks_total} saham yang memiliki harga live."
+                )
 
         st.divider()
 
@@ -668,11 +763,11 @@ with tab4:
         if not trajectory.empty:
             fig4 = go.Figure()
 
-            # Proyeksi P50 (sebagai referensi)
-            time_labels_dt = [t for t in result["time_labels"]]
+            # Proyeksi P50 gabungan (sebagai referensi)
+            time_labels_dt = [t for t in combined_result["time_labels"]]
             fig4.add_trace(go.Scatter(
-                x=time_labels_dt, y=result["p50"],
-                mode="lines", name="Proyeksi Median (P50)",
+                x=time_labels_dt, y=combined_result["p50"],
+                mode="lines", name="Proyeksi Median Gabungan (P50)",
                 line=dict(color="#4fc3f7", width=1.5, dash="dot"),
                 opacity=0.7,
             ))
@@ -744,16 +839,212 @@ with tab4:
                 st.success("Transaksi dihapus.")
                 st.rerun()
 
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION GoTrade
+    # ════════════════════════════════════════════════════════════════════════
+    st.divider()
+    st.subheader("🌍 Riwayat Transaksi GoTrade (USD)")
+
+    # ── Form Input GoTrade ─────────────────────────────────────────────────
+    with st.form("add_gotrade_transaction", clear_on_submit=True):
+        st.markdown("**➕ Catat Transaksi GoTrade**")
+        gcol_a, gcol_b, gcol_c = st.columns(3)
+        gt_date   = gcol_a.date_input("Tanggal", value=date.today(), key="gt_date")
+        gt_ticker = gcol_b.selectbox("ETF", list(FOREIGN_STOCKS.keys()), key="gt_ticker")
+        gt_shares = gcol_c.number_input("Jumlah Shares", min_value=0.0001, value=1.0, step=0.0001, format="%.4f", key="gt_shares")
+        gcol_d, gcol_e, gcol_f = st.columns(3)
+        gt_price  = gcol_d.number_input("Harga (USD/share)", min_value=0.01, value=500.0, step=0.01, format="%.2f", key="gt_price")
+        gt_rate   = gcol_e.number_input("Kurs USD/IDR saat beli", min_value=10_000, max_value=25_000, value=int(usd_idr_rate), step=100, format="%d", key="gt_rate")
+        gt_notes  = gcol_f.text_input("Catatan (opsional)", placeholder="misal: DCA Maret 2026", key="gt_notes")
+        gt_submitted = st.form_submit_button("💾 Simpan Transaksi GoTrade", use_container_width=True)
+
+        if gt_submitted:
+            save_gotrade_transaction(
+                GOTRADE_HISTORY_FILE, gt_date, gt_ticker,
+                gt_shares, gt_price, float(gt_rate), gt_notes,
+            )
+            total_usd = gt_shares * gt_price
+            total_idr = total_usd * gt_rate
+            st.success(
+                f"Tersimpan: {gt_ticker} {gt_shares:.4f} shares @ ${gt_price:.2f} "
+                f"= **${total_usd:.2f}** ≈ **{format_rupiah(int(total_idr))}**"
+            )
+            st.rerun()
+
+    st.divider()
+
+    if gotrade_history.empty:
+        st.info("Belum ada transaksi GoTrade. Catat pembelian ETF-mu di atas!", icon="👆")
+    else:
+        # ── Live prices for GoTrade tickers ───────────────────────────────
+        gotrade_tickers = list(FOREIGN_STOCKS.keys())
+        live_prices_usd = get_current_prices(gotrade_tickers)
+
+        # ── Cost Basis & Unrealized P/L GoTrade ───────────────────────────
+        st.subheader("💼 Holding & Unrealized P/L GoTrade")
+        gt_cost_basis = compute_gotrade_cost_basis(gotrade_history)
+        gt_unrealized = compute_gotrade_unrealized_pl(gt_cost_basis, live_prices_usd, usd_idr_rate)
+
+        gt_pl_rows = []
+        for code in gotrade_tickers:
+            if code not in gt_cost_basis:
+                continue
+            basis = gt_cost_basis[code]
+            pl    = gt_unrealized.get(code, {})
+            gt_pl_rows.append({
+                "ETF": code,
+                "Shares": basis["shares"],
+                "Avg Beli (USD)": basis["avg_price_usd"],
+                "Harga Live (USD)": live_prices_usd.get(code),
+                "Nilai Pasar (USD)": pl.get("market_value_usd"),
+                "Nilai Pasar (IDR)": pl.get("market_value_idr"),
+                "Total Modal (IDR)": int(basis["total_cost_idr"]),
+                "Unrealized (USD)": pl.get("unrealized_usd"),
+                "Unrealized (IDR)": pl.get("unrealized_idr"),
+                "Unrealized (%)": pl.get("unrealized_pct"),
+            })
+
+        gt_pl_df = pd.DataFrame(gt_pl_rows)
+        st.dataframe(
+            gt_pl_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Shares": st.column_config.NumberColumn(format="%.4f"),
+                "Avg Beli (USD)": st.column_config.NumberColumn(format="$%.2f"),
+                "Harga Live (USD)": st.column_config.NumberColumn(format="$%.2f"),
+                "Nilai Pasar (USD)": st.column_config.NumberColumn(format="$%.2f"),
+                "Nilai Pasar (IDR)": st.column_config.NumberColumn(format="Rp %d"),
+                "Total Modal (IDR)": st.column_config.NumberColumn(format="Rp %d"),
+                "Unrealized (USD)": st.column_config.NumberColumn(format="$%.2f"),
+                "Unrealized (IDR)": st.column_config.NumberColumn(format="Rp %d"),
+                "Unrealized (%)": st.column_config.NumberColumn(format="%.2f%%"),
+            },
+        )
+
+        # Summary metrics
+        gt_total_modal_idr = sum(b["total_cost_idr"] for b in gt_cost_basis.values())
+        has_live_prices_gt = any(
+            v.get("market_value_idr") is not None for v in gt_unrealized.values()
+        )
+        if not has_live_prices_gt:
+            st.warning("Harga live tidak tersedia. P/L tidak bisa dihitung.")
+        else:
+            gt_total_pasar_idr = sum(
+                v["market_value_idr"] for v in gt_unrealized.values()
+                if v.get("market_value_idr") is not None
+            )
+            gt_stocks_with_price = sum(
+                1 for v in gt_unrealized.values() if v.get("market_value_idr") is not None
+            )
+            gt_stocks_total = len(gt_unrealized)
+            gt_total_pl_idr = gt_total_pasar_idr - gt_total_modal_idr
+            gt_pl_pct = (gt_total_pl_idr / gt_total_modal_idr * 100) if gt_total_modal_idr > 0 else 0
+            gt_pl_sign = "+" if gt_total_pl_idr >= 0 else ""
+
+            gcol1, gcol2, gcol3 = st.columns(3)
+            gcol1.metric("Total Modal GoTrade", format_rupiah(int(gt_total_modal_idr)))
+            gcol2.metric("Nilai Pasar GoTrade", format_rupiah(int(gt_total_pasar_idr)))
+            gcol3.metric(
+                "Unrealized P/L GoTrade",
+                f"{gt_pl_sign}{format_rupiah(int(gt_total_pl_idr))}",
+                f"{gt_pl_sign}{gt_pl_pct:.1f}%",
+            )
+            if gt_stocks_with_price < gt_stocks_total:
+                st.caption(
+                    f"P/L dihitung dari {gt_stocks_with_price}/{gt_stocks_total} ETF yang memiliki harga live."
+                )
+
+        st.divider()
+
+        # ── Trajectory Chart GoTrade ───────────────────────────────────────
+        st.subheader("📈 Perjalanan Aktual GoTrade")
+        gt_trajectory = compute_gotrade_trajectory(gotrade_history, live_prices_usd, usd_idr_rate)
+
+        if not gt_trajectory.empty:
+            fig_gt = go.Figure()
+            fig_gt.add_trace(go.Scatter(
+                x=gt_trajectory["date"], y=gt_trajectory["total_invested_idr"],
+                mode="lines", name="Modal Diinvestasikan",
+                line=dict(color="#a0a0b0", width=1.5, dash="dash"),
+            ))
+            fig_gt.add_trace(go.Scatter(
+                x=gt_trajectory["date"], y=gt_trajectory["estimated_market_value_idr"],
+                mode="lines+markers", name="Nilai Pasar Aktual (IDR)",
+                line=dict(color="#e377c2", width=2.5),
+                marker=dict(size=6),
+            ))
+            fig_gt.update_layout(
+                xaxis_title="Tanggal",
+                yaxis_title="Nilai (IDR)",
+                yaxis_tickprefix="Rp ",
+                yaxis_tickformat=".2s",
+                hovermode="x unified",
+                height=320,
+                template="plotly_dark",
+                legend=dict(orientation="h", y=1.1),
+            )
+            st.plotly_chart(fig_gt, use_container_width=True)
+            st.caption("Nilai IDR historis menggunakan kurs saat beli. Bulan terakhir pakai harga live + kurs saat ini.")
+
+        st.divider()
+
+        # ── Tabel Riwayat GoTrade + Delete ────────────────────────────────
+        st.subheader("📋 Detail Transaksi GoTrade")
+        gt_display = gotrade_history.copy()
+        gt_display["date"] = gt_display["date"].dt.strftime("%Y-%m-%d")
+        gt_display["Hapus"] = False
+        gt_display = gt_display.rename(columns={
+            "date": "Tanggal", "ticker": "ETF",
+            "shares": "Shares", "price_usd": "Harga (USD)",
+            "usd_idr_rate": "Kurs", "total_cost_usd": "Total (USD)",
+            "total_cost_idr": "Total (IDR)", "notes": "Catatan",
+        })
+
+        gt_edited = st.data_editor(
+            gt_display[["Tanggal", "ETF", "Shares", "Harga (USD)", "Kurs", "Total (USD)", "Total (IDR)", "Catatan", "Hapus"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Shares": st.column_config.NumberColumn(format="%.4f"),
+                "Harga (USD)": st.column_config.NumberColumn(format="$%.2f"),
+                "Kurs": st.column_config.NumberColumn(format="Rp %d"),
+                "Total (USD)": st.column_config.NumberColumn(format="$%.2f"),
+                "Total (IDR)": st.column_config.NumberColumn(format="Rp %d"),
+                "Hapus": st.column_config.CheckboxColumn("Hapus?"),
+            },
+            disabled=["Tanggal", "ETF", "Shares", "Harga (USD)", "Kurs", "Total (USD)", "Total (IDR)", "Catatan"],
+            key="gt_editor",
+        )
+
+        gt_rows_to_delete = gt_edited[gt_edited["Hapus"]].index.tolist()
+        if gt_rows_to_delete:
+            if st.button(
+                f"🗑️ Hapus {len(gt_rows_to_delete)} transaksi GoTrade terpilih",
+                type="primary",
+                key="gt_delete_btn",
+            ):
+                updated_gt = gotrade_history.drop(index=gt_rows_to_delete).reset_index(drop=True)
+                save_gotrade_history(GOTRADE_HISTORY_FILE, updated_gt)
+                st.success("Transaksi GoTrade dihapus.")
+                st.rerun()
+
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 5: WHAT-IF SIMULATOR
 # ════════════════════════════════════════════════════════════════════════════
 with tab5:
     st.subheader("🔮 What-If Simulator")
-    st.caption("Bandingkan skenario berbeda — ubah DCA, skip bulan, atau set target pensiun.")
+    st.caption("Bandingkan skenario berbeda — ubah total DCA, skip bulan, atau set target pensiun.")
+    st.info(
+        f"Simulasi ini menggunakan **total DCA** (IDX + GoTrade gabungan) "
+        f"dengan asumsi blended return. Saat ini: IDX {format_rupiah(idx_dca)}/bln + "
+        f"GoTrade {format_rupiah(gotrade_dca)}/bln = **{format_rupiah(monthly_dca)}/bln**.",
+        icon="ℹ️",
+    )
 
     # ── Section 1: Perbandingan Skenario DCA ──────────────────────────────
     st.markdown("### 📊 Bandingkan 3 Skenario DCA")
-    st.caption("Berapa beda hasilnya kalau DCA dinaikkan atau diturunkan?")
+    st.caption("Berapa beda hasilnya kalau total DCA dinaikkan atau diturunkan?")
 
     col_s1, col_s2, col_s3 = st.columns(3)
     with col_s1:
@@ -778,13 +1069,21 @@ with tab5:
     eff2 = effective_dca(sc2_dca, sc2_skip)
     eff3 = effective_dca(sc3_dca, sc3_skip)
 
-    # Jalankan simulasi untuk ketiga skenario
+    # Blended return gabungan IDX + GoTrade (weighted by DCA ratio)
+    total_dca = idx_dca + gotrade_dca if (idx_dca + gotrade_dca) > 0 else 1
+    w_idx = idx_dca / total_dca
+    w_gt  = gotrade_dca / total_dca
+    combined_cagr = w_idx * blended["cagr"] + w_gt * blended_foreign["cagr"]
+    combined_vol  = w_idx * blended["volatility"] + w_gt * blended_foreign["volatility"]
+    combined_div  = w_idx * blended["div_yield"] + w_gt * blended_foreign["div_yield"]
+
+    # Jalankan simulasi untuk ketiga skenario (menggunakan combined blended metrics)
     common_args = dict(
         initial_value=initial_portfolio_value,
         years=years,
-        annual_return=blended["cagr"],
-        annual_volatility=blended["volatility"],
-        annual_div_yield=blended["div_yield"],
+        annual_return=combined_cagr,
+        annual_volatility=combined_vol,
+        annual_div_yield=combined_div,
         reinvest_div=reinvest_div,
         n_simulations=N_SIMULATIONS,
     )
@@ -847,7 +1146,7 @@ with tab5:
         final = res["simulations"][:, -1]
         total_inv = res["total_invested"][-1]
         p50_val = float(np.percentile(final, 50))
-        div_monthly = p50_val * blended["div_yield"] / 12
+        div_monthly = p50_val * combined_div / 12
         real_div = div_monthly / inflation_factor if show_real else div_monthly
         breakeven_month = next(
             (i for i, v in enumerate(res["p50"]) if v >= res["total_invested"][i] and i > 0),
@@ -898,16 +1197,16 @@ with tab5:
     with col_t2:
         target_years = st.slider("Dalam berapa tahun?", 5, 35, years, key="target_years")
 
-    total_return = blended["cagr"] + blended["div_yield"]
+    total_return = combined_cagr + combined_div
     required_dca = calculate_required_dca(
         target_monthly_income=target_income_nominal,
-        div_yield=blended["div_yield"],
+        div_yield=combined_div,
         annual_return=total_return,
         years=target_years,
         initial_value=initial_portfolio_value,
     )
 
-    target_portfolio = target_income_nominal * 12 / blended["div_yield"] if blended["div_yield"] > 0 else 0
+    target_portfolio = target_income_nominal * 12 / combined_div if combined_div > 0 else 0
 
     col_r1, col_r2, col_r3 = st.columns(3)
     col_r1.metric(
@@ -922,17 +1221,17 @@ with tab5:
         delta_color="inverse" if required_dca > monthly_dca else "normal",
     )
     col_r3.metric(
-        "DCA Kamu Sekarang",
+        "Total DCA Sekarang",
         format_rupiah(monthly_dca),
-        "rencana saat ini",
+        f"IDX {format_rupiah(idx_dca)} + GoTrade {format_rupiah(gotrade_dca)}",
     )
 
     if required_dca <= monthly_dca:
         surplus = monthly_dca - required_dca
         st.success(
-            f"DCA Rp {monthly_dca:,.0f}/bulan sudah cukup untuk target "
+            f"Total DCA {format_rupiah(monthly_dca)}/bulan sudah cukup untuk target "
             f"{format_rupiah(target_income)}/bulan saat pensiun. "
-            f"Kamu bahkan punya surplus {format_rupiah(surplus)}/bulan yang bisa diinvestasikan lebih!"
+            f"Kamu bahkan punya surplus {format_rupiah(surplus)}/bulan!"
         )
     else:
         gap = required_dca - monthly_dca
@@ -1091,3 +1390,124 @@ with tab6:
         "⚠️ Sinyal fundamental hanya alat bantu — bukan rekomendasi beli/jual. "
         "Tetap lakukan riset mandiri sebelum berinvestasi."
     )
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 7: IDX vs ASING
+# ════════════════════════════════════════════════════════════════════════════
+with tab7:
+    st.subheader("🌍 Perbandingan: Saham Indonesia vs ETF Asing")
+    st.caption(
+        f"Perbandingan IDX ({format_rupiah(idx_dca)}/bln) vs GoTrade ({format_rupiah(gotrade_dca)}/bln) "
+        f"selama {years} tahun. Kurs awal Rp {usd_idr_rate:,.0f}, depresiasi {idr_depreciation*100:.1f}%/tahun."
+    )
+
+    years_axis_t7 = result["years_labels"]
+    idx_p50_t7 = result["p50"].copy()
+    idx_p10_t7 = result["p10"].copy()
+    idx_p90_t7 = result["p90"].copy()
+    fg_p50_t7 = foreign_result["p50"].copy()
+    fg_p10_t7 = foreign_result["p10"].copy()
+    fg_p90_t7 = foreign_result["p90"].copy()
+    comb_p50_t7 = combined_result["p50"].copy()
+
+    if show_real:
+        idx_p50_t7 = apply_inflation(idx_p50_t7, years_axis_t7, inflation_rate)
+        idx_p10_t7 = apply_inflation(idx_p10_t7, years_axis_t7, inflation_rate)
+        idx_p90_t7 = apply_inflation(idx_p90_t7, years_axis_t7, inflation_rate)
+        fg_p50_t7 = apply_inflation(fg_p50_t7, years_axis_t7, inflation_rate)
+        fg_p10_t7 = apply_inflation(fg_p10_t7, years_axis_t7, inflation_rate)
+        fg_p90_t7 = apply_inflation(fg_p90_t7, years_axis_t7, inflation_rate)
+        comb_p50_t7 = apply_inflation(comb_p50_t7, years_axis_t7, inflation_rate)
+
+    # ── Metrics ───────────────────────────────────────────────────────────
+    col1, col2, col3 = st.columns(3)
+    col1.metric(
+        "IDX saja (P50)", format_rupiah(idx_p50_t7[-1]),
+        f"CAGR {blended['cagr']*100:.1f}%/thn IDR",
+    )
+    col2.metric(
+        "GoTrade saja (P50)", format_rupiah(fg_p50_t7[-1]),
+        f"CAGR {blended_foreign['cagr']*100:.1f}%/thn USD + kurs",
+    )
+    col3.metric(
+        "Hybrid (P50)", format_rupiah(comb_p50_t7[-1]),
+        f"IDX {idx_ratio}% + GoTrade {gotrade_ratio}%",
+    )
+
+    # ── Chart Perbandingan ────────────────────────────────────────────────
+    fig7 = go.Figure()
+
+    # IDX band
+    fig7.add_trace(go.Scatter(x=years_axis_t7, y=idx_p90_t7/1e6, mode="lines",
+        line=dict(width=0), showlegend=False))
+    fig7.add_trace(go.Scatter(x=years_axis_t7, y=idx_p10_t7/1e6, mode="lines",
+        line=dict(width=0), fill="tonexty", fillcolor="rgba(31,119,180,0.15)",
+        name="IDX P10-P90"))
+    fig7.add_trace(go.Scatter(x=years_axis_t7, y=idx_p50_t7/1e6, mode="lines",
+        line=dict(color="#1f77b4", width=2.5),
+        name=f"IDX — BBRI/ADRO/TLKM ({blended['cagr']*100:.1f}%/thn)"))
+
+    # GoTrade band
+    fig7.add_trace(go.Scatter(x=years_axis_t7, y=fg_p90_t7/1e6, mode="lines",
+        line=dict(width=0), showlegend=False))
+    fig7.add_trace(go.Scatter(x=years_axis_t7, y=fg_p10_t7/1e6, mode="lines",
+        line=dict(width=0), fill="tonexty", fillcolor="rgba(148,103,189,0.15)",
+        name="GoTrade P10-P90"))
+    fig7.add_trace(go.Scatter(x=years_axis_t7, y=fg_p50_t7/1e6, mode="lines",
+        line=dict(color="#9467bd", width=2.5),
+        name=f"GoTrade — VTI/QQQ ({blended_foreign['cagr']*100:.1f}%/thn USD)"))
+
+    # Hybrid
+    fig7.add_trace(go.Scatter(x=years_axis_t7, y=comb_p50_t7/1e6, mode="lines",
+        line=dict(color="#00d4aa", width=3, dash="dash"),
+        name="Hybrid (IDX + GoTrade)"))
+
+    fig7.update_layout(
+        title="IDX vs GoTrade vs Hybrid — Proyeksi 25 Tahun",
+        xaxis_title="Tahun ke-",
+        yaxis_title="Nilai Portfolio (Juta Rp)",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        height=500,
+        template="plotly_dark",
+    )
+    fig7.update_yaxes(tickprefix="Rp ", ticksuffix="M")
+    st.plotly_chart(fig7, use_container_width=True)
+
+    # ── Tabel Milestone ───────────────────────────────────────────────────
+    st.subheader("📊 Milestone Perbandingan")
+    milestone_data = []
+    for yr in [5, 10, 15, 20, 25]:
+        if yr <= years:
+            m_idx = yr * 12
+            invested_at = combined_result["total_invested"][m_idx]
+            milestone_data.append({
+                "Tahun": f"Tahun ke-{yr}",
+                "Modal DCA": format_rupiah(invested_at),
+                "IDX (P50)": format_rupiah(result["p50"][m_idx]),
+                "GoTrade (P50)": format_rupiah(foreign_result["p50"][m_idx]),
+                "Hybrid (P50)": format_rupiah(combined_result["p50"][m_idx]),
+                "Multiplier": f"{combined_result['p50'][m_idx] / invested_at:.1f}x" if invested_at > 0 else "-",
+            })
+    if milestone_data:
+        st.dataframe(pd.DataFrame(milestone_data), use_container_width=True, hide_index=True)
+
+    # ── Asumsi Simulasi ───────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📋 Asumsi Simulasi")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("**🇮🇩 IDX (Saham Indonesia)**")
+        st.markdown(f"- CAGR blended: **{blended['cagr']*100:.1f}%/tahun (IDR)**")
+        st.markdown(f"- Volatilitas: **{blended['volatility']*100:.1f}%**")
+        st.markdown(f"- Div yield: **{blended['div_yield']*100:.1f}%**")
+        st.markdown(f"- DCA: **{format_rupiah(idx_dca)}/bulan**")
+    with col_b:
+        st.markdown("**🌍 GoTrade (ETF Asing)**")
+        st.markdown(f"- CAGR blended: **{blended_foreign['cagr']*100:.1f}%/tahun (USD)**")
+        st.markdown(f"- Volatilitas: **{blended_foreign['volatility']*100:.1f}%**")
+        st.markdown(f"- Div yield: **{blended_foreign['div_yield']*100:.1f}%**")
+        st.markdown(f"- DCA: **{format_rupiah(gotrade_dca)}/bulan**")
+        st.markdown(f"- Kurs awal: **Rp {usd_idr_rate:,.0f}**")
+        st.markdown(f"- Depresiasi IDR: **{idr_depreciation*100:.1f}%/tahun**")
+    st.caption("⚠️ Proyeksi berdasarkan asumsi historis. Bukan rekomendasi investasi.")
